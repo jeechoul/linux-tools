@@ -52,16 +52,82 @@ else
   log '公钥已添加到 /root/.ssh/authorized_keys。'
 fi
 
-# Do not change sshd configuration automatically: existing Match blocks,
-# cloud-init, distro includes, and access policies require careful review.
-if "$SSHD_BIN" -t 2>/dev/null; then
-  log 'sshd 配置语法检查通过。'
+# OpenSSH uses the first global value of each directive. Place explicit settings
+# before Include directives and Match blocks, without altering password auth.
+SSHD_CONFIG=/etc/ssh/sshd_config
+[[ -f "$SSHD_CONFIG" && ! -L "$SSHD_CONFIG" ]] || fail '找不到常规 sshd_config 文件或它是符号链接，请人工检查。'
+
+get_setting() {
+  "$SSHD_BIN" -T "$@" 2>/dev/null | awk -v k="$1" 'tolower($1)==k {print $2; exit}'
+}
+# Do not rely on sshd -T alone: Match rules can change behavior by source IP.
+EFFECTIVE=$("$SSHD_BIN" -T 2>/dev/null) || fail '原始 sshd 配置无效，停止自动修改。'
+CURRENT_PUB=$(printf '%s\n' "$EFFECTIVE" | awk '$1=="pubkeyauthentication" {print $2;exit}')
+CURRENT_KEYS=$(printf '%s\n' "$EFFECTIVE" | awk '$1=="authorizedkeysfile" {$1="";sub(/^ /,"");print;exit}')
+NEEDS_CHANGE=0
+[[ "$CURRENT_PUB" == yes ]] || NEEDS_CHANGE=1
+# Preserve extra authorized_keys paths; just ensure standard path is present.
+[[ " $CURRENT_KEYS " == *" .ssh/authorized_keys "* ]] || NEEDS_CHANGE=1
+
+if (( NEEDS_CHANGE )); then
+  BACKUP="${SSHD_CONFIG}.bak.$(date +%Y%m%d-%H%M%S).$$"
+  cp -p "$SSHD_CONFIG" "$BACKUP" || fail '无法备份 SSH 配置。'
+  log "原始配置已备份：$BACKUP"
+  TMP_CONFIG=$(mktemp "${SSHD_CONFIG}.tmp.XXXXXXXX") || fail '无法创建临时文件。'
+  chmod --reference="$SSHD_CONFIG" "$TMP_CONFIG" 2>/dev/null || chmod 600 "$TMP_CONFIG"
+  chown --reference="$SSHD_CONFIG" "$TMP_CONFIG" 2>/dev/null || true
+  {
+    printf '# Managed by setup-ssh-key.sh; global directives precede Include/Match\n'
+    printf 'PubkeyAuthentication yes\n'
+    if [[ " $CURRENT_KEYS " != *" .ssh/authorized_keys "* ]]; then
+      printf 'AuthorizedKeysFile .ssh/authorized_keys\n'
+    fi
+    cat "$SSHD_CONFIG"
+  } > "$TMP_CONFIG" || fail '生成配置失败。'
+  # Test the candidate in the original location so relative Include semantics remain unchanged.
+  if ! mv -f "$TMP_CONFIG" "$SSHD_CONFIG"; then
+    fail '写入 SSH 配置失败。'
+  fi
+  rollback() {
+    cp -p "$BACKUP" "$SSHD_CONFIG" || err '自动回滚失败，请使用备份手动恢复。'
+  }
+  if ! "$SSHD_BIN" -t; then
+    rollback
+    fail 'sshd 语法验证失败，已尝试回滚；原 SSH 会话请勿关闭。'
+  fi
+  CHECK=$("$SSHD_BIN" -T 2>/dev/null) || { rollback; fail '无法读取新配置，已尝试回滚。'; }
+  if ! printf '%s\n' "$CHECK" | grep -qx 'pubkeyauthentication yes'; then
+    rollback
+    fail '全局公钥认证未生效，已尝试回滚。'
+  fi
+  log 'SSH 全局公钥认证配置已修复并通过语法检查。'
+  RELOADED=0
+  if command -v systemctl >/dev/null 2>&1; then
+    for service in sshd ssh; do
+      if systemctl is-active --quiet "$service"; then
+        if systemctl reload "$service"; then RELOADED=1; break; fi
+      fi
+    done
+  fi
+  if (( ! RELOADED )) && command -v service >/dev/null 2>&1; then
+    for service in sshd ssh; do
+      if service "$service" status >/dev/null 2>&1 && service "$service" reload; then RELOADED=1; break; fi
+    done
+  fi
+  if (( ! RELOADED )); then
+    rollback
+    err '无法确认 SSH 服务成功重载，已尝试回滚配置。请检查服务状态。'
+  else
+    log 'SSH 服务已成功重载（没有强制重启）。'
+  fi
 else
-  err 'sshd 配置检查失败；公钥已写入，但请检查 sshd 配置。'
+  log 'SSH 全局公钥认证已启用，无需修改配置。'
 fi
 
-printf '\n当前 SSH 公钥认证配置（仅供检查）：\n'
+printf '\n当前全局配置：\n'
 "$SSHD_BIN" -T 2>/dev/null | grep -Ei '^(pubkeyauthentication|authorizedkeysfile|permitrootlogin) ' || true
-printf '\n配置已完成。通常仅添加 authorized_keys 不需要重启 SSH 服务。\n'
-printf '请保留当前终端，并在本地另开终端测试：ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no root@服务器IP\n'
-printf '如果失败，请检查 PermitRootLogin、PubkeyAuthentication、云平台策略及 sshd Match 配置。\n'
+printf '\nROOT 本地回环地址条件配置（仅作参考，实际来源 IP 可能匹配不同 Match 规则）：\n'
+"$SSHD_BIN" -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | grep -Ei '^(pubkeyauthentication|authorizedkeysfile|permitrootlogin) ' || true
+printf '\n请保留当前终端，另开本地终端测试：\n'
+printf 'ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no root@服务器IP\n'
+printf '如果失败，请检查 Match、AllowUsers/DenyUsers、云平台策略、密钥和客户端配置。\n'
